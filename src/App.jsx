@@ -1,12 +1,13 @@
 /**
  * ============================================================================
- *  ІНТЕРАКТИВНА КАРТА КВАРТАЛУ  —  src/App.jsx  (версія 8)
+ *  ІНТЕРАКТИВНА КАРТА КВАРТАЛУ  —  src/App.jsx  (версія 9)
  * ============================================================================
  *  Залежності:  npm i leaflet react-leaflet lucide-react @supabase/supabase-js
  *  Клієнт Supabase: src/supabaseClient.js (експортує `supabase`).
  *
- *  Дані: таблиця `buildings` (id, title, floors, category, description,
- *  geometry jsonb у WGS84 [довгота, широта], photos jsonb). Рядки завантажуються
+ *  Дані: таблиці `buildings`, `parkings`, `recreation_zones` (у кожній: address text,
+ *  photos — масив посилань text[] (для buildings допускається і jsonb), geometry jsonb
+ *  у WGS84 [довгота, широта]). Фото завантажуються в Supabase Storage (бакет PHOTOS_BUCKET). Рядки завантажуються
  *  через supabase.from('buildings').select('*') і перетворюються на GeoJSON
  *  FeatureCollection (rowsToFeatureCollection) для Leaflet.
  *
@@ -156,6 +157,9 @@ const PARKING_TYPES = { open: "Відкрита", underground: "Підземна
 const ZONE_TYPES = { park: "Парк", square: "Сквер", sports: "Спортивний майданчик", playground: "Дитячий майданчик" };
 const AMENITIES = ["Лавки", "Освітлення", "Велодоріжки", "Урни", "Фонтан", "Тренажери", "Дитячі гойдалки"];
 
+// Публічний бакет Supabase Storage для фотографій об'єктів (створіть його — див. SQL в інструкції)
+const PHOTOS_BUCKET = "object-photos";
+
 // Значення довідника (ключ або українська назва) → ключ; невідоме значення лишається як є
 const pickKey = (map, v) => {
   const t = String(v ?? "").trim();
@@ -238,7 +242,8 @@ function toCategoryKeys(raw) {
   return keys.length ? keys : ["residential"];
 }
 
-// Колонка photos (jsonb) → масив посилань; терпимо до рядка з JSON та до старої колонки photo_url
+// Колонка photos (text[] або jsonb) → масив посилань; терпимо до рядка з JSON.
+// Якщо масив порожній, а в рядку є стара колонка photo_url — показуємо її.
 function toPhotos(p) {
   let v = p.photos;
   if (typeof v === "string") {
@@ -248,8 +253,9 @@ function toPhotos(p) {
       v = v.trim() ? [v.trim()] : [];
     }
   }
-  if (!Array.isArray(v)) v = p.photo_url ? [p.photo_url] : [];
-  return v.filter((x) => typeof x === "string" && x.trim());
+  let list = Array.isArray(v) ? v.filter((x) => typeof x === "string" && x.trim()) : [];
+  if (list.length === 0 && p.photo_url) list = [p.photo_url];
+  return list;
 }
 
 // Feature з FeatureCollection → об'єкт, з яким працює інтерфейс
@@ -300,7 +306,7 @@ function featureToParking(f, index) {
     kind: "parking",
     table: TABLES.parking,
     name: p.title || `Паркінг №${index + 1}`,
-    number: "",
+    number: p.address || "",
     categories: ["parking"],
     category: "parking",
     status: "",
@@ -312,7 +318,7 @@ function featureToParking(f, index) {
       capacity != null && `Машиномісць: ${capacity}`,
       parkingType && `Тип: ${PARKING_TYPES[parkingType] || parkingType}`,
     ].filter(Boolean),
-    photos: p.photo_url ? [p.photo_url] : [], // одна колонка photo_url
+    photos: toPhotos(p), // масив у колонці photos (фолбек — стара photo_url)
     geometry: f.geometry,
   };
 }
@@ -328,7 +334,7 @@ function featureToRecreation(f, index) {
     kind: "recreation",
     table: TABLES.recreation,
     name: p.title || `Зона №${index + 1}`,
-    number: "",
+    number: p.address || "",
     categories: ["recreation"],
     category: "recreation",
     status: "",
@@ -340,7 +346,7 @@ function featureToRecreation(f, index) {
       zoneType && `Тип: ${ZONE_TYPES[zoneType] || zoneType}`,
       amenities.length > 0 && `Благоустрій: ${amenities.join(", ")}`,
     ].filter(Boolean),
-    photos: p.photo_url ? [p.photo_url] : [],
+    photos: toPhotos(p),
     geometry: f.geometry,
   };
 }
@@ -519,28 +525,73 @@ function computeBuildingDistances(objects) {
 }
 
 /* ============================================================================
- *  4. ФАЙЛ → Base64 (для фото, що записуються в photos)
+ *  4. ФОТО → SUPABASE STORAGE
+ *   Файли стискаються в браузері (до 1600 px, JPEG) і завантажуються в бакет
+ *   PHOTOS_BUCKET. У базу (колонка photos) записуються лише публічні посилання.
  * ============================================================================ */
-// Файл → Base64 із зменшенням (щоб рядок у масиві photos не був надто великим)
-function fileToDataUrl(file, maxSide = 1000, quality = 0.8) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error("Не вдалося прочитати файл"));
-    reader.onload = () => {
-      const img = new Image();
-      img.onerror = () => reject(new Error("Це не зображення"));
-      img.onload = () => {
-        const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
-        const canvas = document.createElement("canvas");
-        canvas.width = Math.round(img.width * scale);
-        canvas.height = Math.round(img.height * scale);
-        canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
-        resolve(canvas.toDataURL("image/jpeg", quality));
-      };
-      img.src = reader.result;
+
+// Стискання зображення; якщо браузер не вміє його прочитати — повертаємо оригінальний файл
+function compressImage(file, maxSide = 1600, quality = 0.85) {
+  return new Promise((resolve) => {
+    const objectUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      resolve(file);
     };
-    reader.readAsDataURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob((blob) => resolve(blob || file), "image/jpeg", quality);
+    };
+    img.src = objectUrl;
   });
+}
+
+function explainStorageError(err) {
+  const msg = err?.message || String(err);
+  if (/bucket not found/i.test(msg))
+    return `Бакет «${PHOTOS_BUCKET}» не знайдено. Створіть його в Supabase Storage (SQL — в інструкції).`;
+  if (/row-level security|not authorized|unauthorized|permission/i.test(msg))
+    return "Немає прав на завантаження файлів (політика Storage для authenticated). Перевірте, що ви увійшли в акаунт.";
+  return msg;
+}
+
+// Завантажує файли по одному; повертає { urls: [...публічні посилання], errors: [...] }
+async function uploadPhotos(files, folder = "misc") {
+  const urls = [];
+  const errors = [];
+  for (const file of files) {
+    try {
+      const blob = await compressImage(file);
+      const ext = blob.type === "image/jpeg" ? "jpg" : (file.name.split(".").pop() || "bin").toLowerCase();
+      const path = `${folder}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+      const { error } = await supabase.storage
+        .from(PHOTOS_BUCKET)
+        .upload(path, blob, { contentType: blob.type || file.type, cacheControl: "31536000", upsert: false });
+      if (error) throw error;
+      urls.push(supabase.storage.from(PHOTOS_BUCKET).getPublicUrl(path).data.publicUrl);
+    } catch (err) {
+      console.error("Storage upload error:", err);
+      errors.push(`${file.name}: ${explainStorageError(err)}`);
+    }
+  }
+  return { urls, errors };
+}
+
+// Видаляє з Storage файли за публічними посиланнями (best effort; чужі / base64-посилання ігноруються)
+async function removeFromStorage(urls) {
+  const marker = `/storage/v1/object/public/${PHOTOS_BUCKET}/`;
+  const paths = (urls || [])
+    .filter((u) => typeof u === "string" && u.includes(marker))
+    .map((u) => decodeURIComponent(u.split(marker)[1].split("?")[0]));
+  if (paths.length === 0) return;
+  const { error } = await supabase.storage.from(PHOTOS_BUCKET).remove(paths);
+  if (error) console.warn("Не вдалося видалити файли зі Storage:", error);
 }
 
 /* ============================================================================
@@ -561,7 +612,8 @@ function buildDbPayload(data, meta) {
     floors: Number(data.floors) || 1,
     entrances: Number(data.entrances) || 1,
     apartments: Number(data.apartments) || 0,
-    photos: Array.isArray(data.photos) ? data.photos : [], // jsonb-масив посилань
+    photos: Array.isArray(data.photos) ? data.photos : [], // масив посилань (text[] / jsonb)
+    photo_url: (Array.isArray(data.photos) && data.photos[0]) || null, // лише якщо така колонка є (фільтр нижче)
   };
   if (!meta.columns) return all;
   return Object.fromEntries(Object.entries(all).filter(([k]) => meta.columns.has(k)));
@@ -569,6 +621,9 @@ function buildDbPayload(data, meta) {
 
 function explainDbError(err) {
   const msg = err?.message || String(err);
+  const col = msg.match(/could not find the '([^']+)' column of '([^']+)'/i);
+  if (col)
+    return `У таблиці «${col[2]}» немає колонки «${col[1]}». Додайте її (SQL — в інструкції), оновіть сторінку й повторіть.`;
   if (err?.code === "42501" || /row-level security/i.test(msg))
     return "Немає прав на запис у базу (політика RLS). Перевірте політики INSERT/UPDATE/DELETE для авторизованих користувачів.";
   if (/failed to fetch|networkerror|network request/i.test(msg))
@@ -1097,6 +1152,11 @@ export default function App() {
   const [focusTick, setFocusTick] = useState(0);
   const [heatMode, setHeatMode] = useState(false); // підсвітка за поверховістю
   const [saving, setSaving] = useState(false); // триває запис у Supabase (форма)
+  const [uploading, setUploading] = useState(false); // триває завантаження фото в Storage (панель об'єкта)
+  // Легенда карти: на телефонах (< 768px) за замовчуванням згорнута
+  const [legendOpen, setLegendOpen] = useState(
+    () => typeof window === "undefined" || window.matchMedia("(min-width: 768px)").matches
+  );
   const [showDistances, setShowDistances] = useState(false); // шар «Відстані між будинками»
   const [distOverrides, setDistOverrides] = useState({}); // "aId|bId" → { meters }
   const [distEditing, setDistEditing] = useState(null); // { key, stamp }
@@ -1425,14 +1485,18 @@ export default function App() {
         title: form.name.trim(),
         capacity: Number(form.capacity) || 0,
         parking_type: form.parkingType || null,
-        photo_url: (form.photos || [])[0] || null,
+        address: form.number.trim() || null,
+        photos: form.photos || [], // масив посилань (колонка photos text[])
+        photo_url: (form.photos || [])[0] || null, // сумісність зі старою колонкою
       };
     } else if (kind === "recreation") {
       payload = {
         title: form.name.trim(),
         zone_type: form.zoneType || null,
         amenities_list: Array.isArray(form.amenities) ? form.amenities : [], // jsonb-масив
-        photo_url: (form.photos || [])[0] || null,
+        address: form.number.trim() || null,
+        photos: form.photos || [], // масив посилань (колонка photos text[])
+        photo_url: (form.photos || [])[0] || null, // сумісність зі старою колонкою
       };
     } else {
       if (!form.categories || form.categories.length === 0) {
@@ -1455,6 +1519,21 @@ export default function App() {
       );
     }
 
+    // Адреса не має губитись мовчки: якщо в buildings немає колонки address — попереджаємо
+    if (
+      kind === "building" &&
+      form.number.trim() &&
+      dbMeta.current.columns &&
+      !dbMeta.current.columns.has("address")
+    ) {
+      alert(
+        "У таблиці buildings немає колонки «address», тому адресу неможливо зберегти.\n" +
+          "Виконайте в Supabase SQL Editor:\nalter table buildings add column if not exists address text;\n" +
+          "потім оновіть сторінку."
+      );
+      return;
+    }
+
     setSaving(true);
     try {
       let newId = null;
@@ -1466,7 +1545,7 @@ export default function App() {
 
         if (error) {
           console.error("Supabase Error:", error);
-          alert("Помилка Supabase: " + error.message);
+          alert("Помилка Supabase: " + explainDbError(error));
           return; // форма лишається відкритою
         }
         if (!data || data.length === 0) {
@@ -1486,7 +1565,7 @@ export default function App() {
 
         if (error) {
           console.error("Supabase Error:", error);
-          alert("Помилка Supabase: " + error.message);
+          alert("Помилка Supabase: " + explainDbError(error));
           return;
         }
         newId = `${kind}:${data.id}`;
@@ -1503,7 +1582,7 @@ export default function App() {
       }
     } catch (err) {
       console.error("Supabase Error:", err);
-      alert("Помилка Supabase: " + (err?.message || String(err)));
+      alert("Помилка Supabase: " + explainDbError(err));
     } finally {
       setSaving(false);
     }
@@ -1555,14 +1634,14 @@ export default function App() {
     }
   };
 
-  // Фото: будинки — масив у колонці photos (jsonb); паркінги й зони — одне посилання в photo_url
+  // Фото: для всіх типів об'єктів — масив посилань у колонці photos (text[] / jsonb).
+  // photo_url синхронізується з першим фото (для паркінгів і зон — завжди; для будинків — якщо колонка є).
   const savePhoto = async (b, photos) => {
+    const list = photos || [];
+    const patch = { photos: list };
+    if (b.kind !== "building" || dbMeta.current.columns?.has("photo_url")) patch.photo_url = list[0] || null;
     try {
-      const { data, error } = await supabase
-        .from(b.table)
-        .update(b.kind === "building" ? { photos: photos || [] } : { photo_url: photos?.[0] || null })
-        .eq("id", b.dbId)
-        .select("id");
+      const { data, error } = await supabase.from(b.table).update(patch).eq("id", b.dbId).select("id");
       if (error) {
         alert("Не вдалося зберегти фото: " + explainDbError(error));
         return false;
@@ -1580,22 +1659,32 @@ export default function App() {
     }
   };
 
-  const addPhotoToSelected = async (file) => {
-    if (!canEdit || !file || !selected) return;
+  // Кілька файлів одразу: завантаження в Storage → посилання додаються в масив photos
+  const addPhotosToSelected = async (files) => {
+    if (!canEdit || !selected || uploading) return;
+    const list = Array.from(files || []).filter((f) => f.type.startsWith("image/"));
+    if (list.length === 0) return;
+    setUploading(true);
     try {
-      const url = await fileToDataUrl(file);
-      // будинок: нове фото додається в кінець масиву; паркінг / зона: єдине фото замінюється
-      const next = selected.kind === "building" ? [...(selected.photos || []), url] : [url];
+      const { urls, errors } = await uploadPhotos(list, selected.kind);
+      if (errors.length) alert("Не вдалося завантажити:\n" + errors.join("\n"));
+      if (urls.length === 0) return;
+      const next = [...(selected.photos || []), ...urls];
       if (await savePhoto(selected, next)) setActivePhoto(next.length - 1);
-    } catch (err) {
-      alert(err.message);
+      else await removeFromStorage(urls); // запис у базу не вдався — прибираємо щойно завантажені файли
+    } finally {
+      setUploading(false);
     }
   };
 
   const removePhoto = async (index) => {
     if (!canEdit || !selected) return;
+    const removed = (selected.photos || [])[index];
     const next = (selected.photos || []).filter((_, i) => i !== index);
-    if (await savePhoto(selected, next)) setActivePhoto(0);
+    if (await savePhoto(selected, next)) {
+      setActivePhoto(0);
+      removeFromStorage([removed]); // best effort: файл більше не потрібен
+    }
   };
 
   /* ========================================================================
@@ -1719,7 +1808,7 @@ export default function App() {
       {/* ====================== MAIN ====================== */}
       <main className={`flex min-h-0 w-full flex-1 flex-col md:flex-row ${placingId || drawing ? "placing" : ""}`}>
         {/* ---------- КАРТА ---------- */}
-        <div className="relative h-[55vh] shrink-0 md:h-auto md:min-w-0 md:flex-1">
+        <div className="relative h-[43vh] min-h-[260px] shrink-0 md:h-auto md:min-w-0 md:flex-1">
           <div className="absolute inset-0">
             <MapContainer
               ref={mapRef}
@@ -1852,59 +1941,78 @@ export default function App() {
             </div>
           )}
 
-          {/* Легенда */}
-          <div className="absolute bottom-6 left-3 z-[500] rounded-lg bg-white/95 p-2.5 text-xs shadow">
+          {/* Легенда: згортальна; на телефонах за замовчуванням згорнута.
+              Кнопка-тогл завжди внизу, список росте вгору й прокручується всередині. */}
+          <div className="absolute bottom-6 left-3 z-[500] flex max-w-[calc(100%-1.5rem)] flex-col-reverse items-start gap-1.5">
             <button
               type="button"
-              role="switch"
-              aria-checked={heatMode}
-              onClick={() => setHeatMode((v) => !v)}
-              className="mb-2 flex w-full items-center justify-between gap-3 rounded-md border border-stone-200 px-2 py-1.5 font-medium hover:bg-stone-50"
+              onClick={() => setLegendOpen((v) => !v)}
+              aria-expanded={legendOpen}
+              aria-controls="map-legend"
+              className="flex items-center gap-1.5 rounded-lg bg-white/95 px-3 py-1.5 text-xs font-semibold shadow hover:bg-white"
             >
-              Підсвітка за поверховістю
-              <span className={`relative h-4 w-7 shrink-0 rounded-full transition ${heatMode ? "bg-[#2f5d8a]" : "bg-stone-300"}`}>
-                <span
-                  className={`absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all ${heatMode ? "left-3.5" : "left-0.5"}`}
-                />
-              </span>
+              <Layers size={14} />
+              {legendOpen ? "Сховати легенду" : "Показати легенду"}
+              <ChevronDown size={14} className={`transition-transform ${legendOpen ? "" : "rotate-180"}`} />
             </button>
-            <button
-              type="button"
-              role="switch"
-              aria-checked={showDistances}
-              onClick={() => setShowDistances((v) => !v)}
-              className="mb-2 flex w-full items-center justify-between gap-3 rounded-md border border-stone-200 px-2 py-1.5 font-medium hover:bg-stone-50"
-            >
-              <span className="flex items-center gap-1.5">
-                <Ruler size={14} /> Відстані між будинками
-              </span>
-              <span className={`relative h-4 w-7 shrink-0 rounded-full transition ${showDistances ? "bg-[#2f5d8a]" : "bg-stone-300"}`}>
-                <span
-                  className={`absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all ${showDistances ? "left-3.5" : "left-0.5"}`}
-                />
-              </span>
-            </button>
-            {showDistances && (
-              <div className="-mt-1 mb-2 text-[11px] leading-snug text-stone-500">
-                {canEdit ? "Клік на мітці — змінити значення" : "Увійдіть, щоб редагувати значення"}
+            {legendOpen && (
+              <div
+                id="map-legend"
+                className="max-h-[calc(43vh-4rem)] w-full overflow-y-auto overscroll-contain rounded-lg bg-white/95 p-2.5 text-xs shadow md:max-h-[60vh]"
+              >
+              <button
+                type="button"
+                role="switch"
+                aria-checked={heatMode}
+                onClick={() => setHeatMode((v) => !v)}
+                className="mb-2 flex w-full items-center justify-between gap-3 rounded-md border border-stone-200 px-2 py-1.5 font-medium hover:bg-stone-50"
+              >
+                Підсвітка за поверховістю
+                <span className={`relative h-4 w-7 shrink-0 rounded-full transition ${heatMode ? "bg-[#2f5d8a]" : "bg-stone-300"}`}>
+                  <span
+                    className={`absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all ${heatMode ? "left-3.5" : "left-0.5"}`}
+                  />
+                </span>
+              </button>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={showDistances}
+                onClick={() => setShowDistances((v) => !v)}
+                className="mb-2 flex w-full items-center justify-between gap-3 rounded-md border border-stone-200 px-2 py-1.5 font-medium hover:bg-stone-50"
+              >
+                <span className="flex items-center gap-1.5">
+                  <Ruler size={14} /> Відстані між будинками
+                </span>
+                <span className={`relative h-4 w-7 shrink-0 rounded-full transition ${showDistances ? "bg-[#2f5d8a]" : "bg-stone-300"}`}>
+                  <span
+                    className={`absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all ${showDistances ? "left-3.5" : "left-0.5"}`}
+                  />
+                </span>
+              </button>
+              {showDistances && (
+                <div className="-mt-1 mb-2 text-[11px] leading-snug text-stone-500">
+                  {canEdit ? "Клік на мітці — змінити значення" : "Увійдіть, щоб редагувати значення"}
+                </div>
+              )}
+              {heatMode && (
+                <div className="mb-2 border-b border-stone-200 pb-2">
+                  {FLOOR_BANDS.map((band) => (
+                    <div key={band.label} className="flex items-center gap-2 py-0.5">
+                      <span className="h-3 w-5 rounded-sm bg-stone-700" style={{ opacity: band.fill }} />
+                      {band.label}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {Object.entries(CATEGORIES).map(([key, c]) => (
+                <div key={key} className="flex items-center gap-2 py-0.5">
+                  <span className="h-3 w-3 rounded-sm" style={{ background: c.color, border: `1.5px solid ${c.stroke}` }} />
+                  {c.label}
+                </div>
+              ))}
               </div>
             )}
-            {heatMode && (
-              <div className="mb-2 border-b border-stone-200 pb-2">
-                {FLOOR_BANDS.map((band) => (
-                  <div key={band.label} className="flex items-center gap-2 py-0.5">
-                    <span className="h-3 w-5 rounded-sm bg-stone-700" style={{ opacity: band.fill }} />
-                    {band.label}
-                  </div>
-                ))}
-              </div>
-            )}
-            {Object.entries(CATEGORIES).map(([key, c]) => (
-              <div key={key} className="flex items-center gap-2 py-0.5">
-                <span className="h-3 w-3 rounded-sm" style={{ background: c.color, border: `1.5px solid ${c.stroke}` }} />
-                {c.label}
-              </div>
-            ))}
           </div>
         </div>
 
@@ -1931,7 +2039,8 @@ export default function App() {
               onEdit={() => openEdit(selected)}
               onDelete={() => deleteBuilding(selected)}
               onMove={() => setPlacingId(selected.id)}
-              onAddPhoto={addPhotoToSelected}
+              onAddPhoto={addPhotosToSelected}
+              uploading={uploading}
               onRemovePhoto={removePhoto}
               canEdit={canEdit}
             />
@@ -2056,6 +2165,7 @@ function BuildingPanel({
   onAddPhoto,
   onRemovePhoto,
   canEdit,
+  uploading,
 }) {
   const fileRef = useRef(null);
   const cat = getCat(getDisplayCategory(b.categories, activePlan));
@@ -2130,31 +2240,35 @@ function BuildingPanel({
       </div>
       )}
 
-      {/* Мініатюри всіх фото */}
+      {/* Галерея: сітка мініатюр усіх фото (клік — показати велике) */}
       {photos.length > 1 && (
-        <div className="flex gap-2 overflow-x-auto px-4 pb-1 pt-3">
-          {photos.map((p, i) => (
-            <div key={i} className="relative shrink-0">
-              <button onClick={() => setActivePhoto(i)} aria-label={`Фото ${i + 1}`}>
-                <img
-                  src={p}
-                  alt=""
-                  className={`h-14 w-14 rounded-md object-cover ${
-                    i === idx ? "ring-2 ring-[#2f5d8a]" : "opacity-70 hover:opacity-100"
-                  }`}
-                />
-              </button>
-              {canEdit && (
-                <button
-                  onClick={() => onRemovePhoto(i)}
-                  className="absolute -right-1 -top-1 rounded-full bg-red-600 p-0.5 text-white"
-                  aria-label="Видалити фото"
-                >
-                  <X size={12} />
+        <div className="px-4 pb-1 pt-3">
+          <div className="mb-1.5 text-xs font-semibold text-stone-500">Фотографії ({photos.length})</div>
+          <div className="grid grid-cols-4 gap-2">
+            {photos.map((p, i) => (
+              <div key={i} className="relative aspect-square">
+                <button onClick={() => setActivePhoto(i)} aria-label={`Фото ${i + 1}`} className="h-full w-full">
+                  <img
+                    src={p}
+                    alt=""
+                    loading="lazy"
+                    className={`h-full w-full rounded-md object-cover ${
+                      i === idx ? "ring-2 ring-[#2f5d8a]" : "opacity-70 hover:opacity-100"
+                    }`}
+                  />
                 </button>
-              )}
-            </div>
-          ))}
+                {canEdit && (
+                  <button
+                    onClick={() => onRemovePhoto(i)}
+                    className="absolute -right-1 -top-1 rounded-full bg-red-600 p-0.5 text-white"
+                    aria-label="Видалити фото"
+                  >
+                    <X size={12} />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
@@ -2206,9 +2320,11 @@ function BuildingPanel({
             </button>
             <button
               onClick={() => fileRef.current?.click()}
-              className="flex items-center justify-center gap-1.5 rounded-lg border border-stone-300 px-3 py-2 text-sm font-semibold hover:bg-stone-50"
+              disabled={uploading}
+              className="flex items-center justify-center gap-1.5 rounded-lg border border-stone-300 px-3 py-2 text-sm font-semibold hover:bg-stone-50 disabled:opacity-60"
             >
-              <ImagePlus size={15} /> {isBuilding || photos.length === 0 ? "Нове фото" : "Замінити фото"}
+              {uploading ? <Loader2 size={15} className="animate-spin" /> : <ImagePlus size={15} />}
+              {uploading ? "Завантаження…" : "Додати фото"}
             </button>
             <button
               onClick={onMove}
@@ -2228,9 +2344,10 @@ function BuildingPanel({
             ref={fileRef}
             type="file"
             accept="image/*"
+            multiple
             className="hidden"
             onChange={(e) => {
-              onAddPhoto(e.target.files?.[0]);
+              onAddPhoto(e.target.files);
               e.target.value = "";
             }}
           />
@@ -2248,7 +2365,7 @@ function BuildingModal({ form, setForm, onSave, onClose, saving }) {
   const fileRef = useRef(null);
   const [url, setUrl] = useState("");
   const [amenityInput, setAmenityInput] = useState("");
-  const single = (form.kind || "building") !== "building"; // паркінг / зона: одне фото (колонка photo_url)
+  const [uploading, setUploading] = useState(false); // триває завантаження файлів у Storage
   const set = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.value }));
   const toggleCategory = (key) =>
     setForm((f) => {
@@ -2280,18 +2397,21 @@ function BuildingModal({ form, setForm, onSave, onClose, saving }) {
       alert("Посилання має починатися з http:// або https://:\n" + bad.join("\n"));
       return;
     }
-    setForm((f) => ({ ...f, photos: single ? [urls[0]] : [...new Set([...(f.photos || []), ...urls])] }));
+    setForm((f) => ({ ...f, photos: [...new Set([...(f.photos || []), ...urls])] }));
     setUrl("");
   };
 
+  // Кілька файлів одразу → Supabase Storage → посилання додаються у form.photos
   const addFiles = async (files) => {
-    for (const file of Array.from(files || [])) {
-      try {
-        const data = await fileToDataUrl(file);
-        setForm((f) => ({ ...f, photos: single ? [data] : [...(f.photos || []), data] }));
-      } catch (err) {
-        alert(err.message);
-      }
+    const list = Array.from(files || []).filter((f) => f.type.startsWith("image/"));
+    if (list.length === 0) return;
+    setUploading(true);
+    try {
+      const { urls, errors } = await uploadPhotos(list, form.kind || "building");
+      if (urls.length) setForm((f) => ({ ...f, photos: [...new Set([...(f.photos || []), ...urls])] }));
+      if (errors.length) alert("Не вдалося завантажити:\n" + errors.join("\n"));
+    } finally {
+      setUploading(false);
     }
   };
 
@@ -2324,6 +2444,20 @@ function BuildingModal({ form, setForm, onSave, onClose, saving }) {
                   ? "Наприклад, Сквер ім. Шевченка"
                   : "Наприклад, Будинок 12"
               }
+            />
+          </label>
+
+          {/* Адреса — повноцінне текстове поле для будь-якого типу об'єкта (зберігається в колонку address) */}
+          <label className="block text-sm font-medium">
+            Адреса
+            <input
+              type="text"
+              name="address"
+              autoComplete="street-address"
+              value={form.number}
+              onChange={set("number")}
+              className={`${inputCls} mt-1`}
+              placeholder="вул. Дмитра Яворницького, 12"
             />
           </label>
 
@@ -2413,11 +2547,6 @@ function BuildingModal({ form, setForm, onSave, onClose, saving }) {
           {(form.kind || "building") === "building" && (
             <>
 
-          <label className="block text-sm font-medium">
-            Номер або адреса
-            <input value={form.number} onChange={set("number")} className={`${inputCls} mt-1`} placeholder="вул. Дмитра Яворницького, 12" />
-          </label>
-
           <fieldset>
             <legend className="text-sm font-medium">Категорії (можна кілька)</legend>
             <div className="mt-1 grid grid-cols-2 gap-2">
@@ -2499,7 +2628,7 @@ function BuildingModal({ form, setForm, onSave, onClose, saving }) {
           )}
 
           <div>
-            <div className="text-sm font-medium">{single ? "Фото (одне)" : "Фото (можна кілька; перше — головне)"}</div>
+            <div className="text-sm font-medium">Фото (можна вибрати кілька; перше — головне)</div>
             {(form.photos || []).length > 0 && (
               <div className="mt-2 flex flex-wrap gap-2">
                 {form.photos.map((p, i) => (
@@ -2527,7 +2656,7 @@ function BuildingModal({ form, setForm, onSave, onClose, saving }) {
                     addUrl();
                   }
                 }}
-                placeholder={single ? "https://… посилання на фото" : "https://… одне або кілька посилань"}
+                placeholder="https://… одне або кілька посилань"
                 className={inputCls}
               />
               <button type="button" onClick={addUrl} className="flex shrink-0 items-center gap-1 rounded-lg border border-stone-300 px-3 text-sm hover:bg-stone-50">
@@ -2537,15 +2666,17 @@ function BuildingModal({ form, setForm, onSave, onClose, saving }) {
             <button
               type="button"
               onClick={() => fileRef.current?.click()}
-              className="mt-2 flex items-center gap-1.5 text-sm font-medium text-[#2f5d8a] hover:underline"
+              disabled={uploading}
+              className="mt-2 flex items-center gap-1.5 text-sm font-medium text-[#2f5d8a] hover:underline disabled:opacity-60"
             >
-              <ImagePlus size={15} /> Вибрати файли з комп'ютера
+              {uploading ? <Loader2 size={15} className="animate-spin" /> : <ImagePlus size={15} />}
+              {uploading ? "Завантаження файлів…" : "Вибрати файли (можна кілька)"}
             </button>
             <input
               ref={fileRef}
               type="file"
               accept="image/*"
-              multiple={!single}
+              multiple
               className="hidden"
               onChange={(e) => {
                 addFiles(e.target.files);
@@ -2573,7 +2704,7 @@ function BuildingModal({ form, setForm, onSave, onClose, saving }) {
           </button>
           <button
             type="submit"
-            disabled={saving}
+            disabled={saving || uploading}
             className="flex items-center gap-1.5 rounded-lg bg-[#2f5d8a] px-4 py-2 text-sm font-semibold text-white hover:bg-[#264d73] disabled:opacity-60"
           >
             {saving && <Loader2 size={15} className="animate-spin" />}
